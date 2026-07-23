@@ -1,6 +1,6 @@
 import { runAppleScript } from "@raycast/utils";
 import { Clipboard } from "@raycast/api";
-import { getFirefoxTabs } from "./firefox";
+import { getFirefoxTabs, getFirefoxActiveUrl } from "./firefox";
 
 export async function getActiveUrl(): Promise<string | null> {
   console.log("Starting getActiveUrl...");
@@ -36,14 +36,10 @@ export async function getActiveUrl(): Promise<string | null> {
         console.log("Safari error:", e);
       }
     } else if (frontmostApp === "Firefox") {
-      try {
-        browserUrl = await runAppleScript(
-          'tell application "Firefox" to return URL of active tab of front window',
-        );
-        console.log("Firefox URL:", browserUrl);
-      } catch (e) {
-        console.log("Firefox error:", e);
-      }
+      // Firefox has no AppleScript API for the active tab; read the session store.
+      const firefoxUrl = getFirefoxActiveUrl();
+      if (firefoxUrl) browserUrl = firefoxUrl;
+      console.log("Firefox URL:", browserUrl);
     } else {
       console.log("Frontmost app is not a supported browser:", frontmostApp);
     }
@@ -56,6 +52,19 @@ export async function getActiveUrl(): Promise<string | null> {
     }
   } catch (e) {
     console.error("Browser detection error:", e);
+  }
+
+  // Firefox session fallback: invoking a Raycast command makes Raycast the
+  // frontmost app, so the branch above often never sees Firefox. Reading the
+  // session store works regardless of which app is focused.
+  try {
+    const firefoxUrl = getFirefoxActiveUrl();
+    console.log("Firefox session fallback URL:", firefoxUrl);
+    if (firefoxUrl && firefoxUrl.startsWith("http")) {
+      return firefoxUrl;
+    }
+  } catch (e) {
+    console.log("Firefox session fallback error:", e);
   }
 
   // Fallback to Clipboard

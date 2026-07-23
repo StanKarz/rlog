@@ -11,10 +11,13 @@ interface FirefoxTab {
 
 interface FirefoxWindow {
   tabs: FirefoxTab[];
+  selected?: number; // 1-based index of the active tab in this window
+  isPrivate?: boolean;
 }
 
 interface FirefoxSession {
   windows: FirefoxWindow[];
+  selectedWindow?: number; // 1-based index of the focused window
 }
 
 /**
@@ -25,7 +28,7 @@ interface FirefoxSession {
  * profile can be flagged default yet never have been launched, in which case it has
  * no session store at all.
  */
-function getProfileCandidates(firefoxDir: string): string[] {
+export function getProfileCandidates(firefoxDir: string): string[] {
   const profilesIniPath = path.join(firefoxDir, "profiles.ini");
 
   if (!fs.existsSync(profilesIniPath)) {
@@ -62,7 +65,7 @@ function getProfileCandidates(firefoxDir: string): string[] {
 }
 
 /** Locate the newest session store among the candidate profiles. */
-function findRecoveryFile(firefoxDir: string): string | null {
+export function findRecoveryFile(firefoxDir: string): string | null {
   for (const candidate of getProfileCandidates(firefoxDir)) {
     if (!candidate || !fs.existsSync(candidate)) continue;
 
@@ -85,7 +88,7 @@ function findRecoveryFile(firefoxDir: string): string | null {
  * be decoded with `decompressBlock` into a correctly sized buffer rather than with
  * the frame-level `decompress`.
  */
-function readSessionStore(recoveryPath: string): FirefoxSession | null {
+export function readSessionStore(recoveryPath: string): FirefoxSession | null {
   const fileBuffer = fs.readFileSync(recoveryPath);
 
   if (fileBuffer.subarray(0, 8).toString("utf8") !== "mozLz40\0") {
@@ -100,6 +103,34 @@ function readSessionStore(recoveryPath: string): FirefoxSession | null {
   lz4js.decompressBlock(compressed, decompressed, 0, compressed.length, 0);
 
   return JSON.parse(Buffer.from(decompressed).toString("utf8"));
+}
+
+/**
+ * Collect the current URL of every open tab in a session.
+ *
+ * Private-browsing windows are skipped defensively. Firefox does not persist
+ * private windows to the session store in the first place, so in practice they
+ * never reach here — but a fork or future version that did must not leak private
+ * URLs into a public reading log. Closed tabs and closed windows (`_closedTabs`,
+ * `_closedWindows`) are ignored: only live `window.tabs` are read.
+ */
+export function extractTabUrls(session: FirefoxSession): string[] {
+  const urls: string[] = [];
+
+  for (const window of session.windows) {
+    if (window.isPrivate) continue;
+
+    for (const tab of window.tabs) {
+      // tab.entries is history for that tab; tab.index is the current position (1-based).
+      const activeEntryIndex = (tab.index || 1) - 1;
+      const entry = tab.entries?.[activeEntryIndex];
+      if (entry?.url) {
+        urls.push(entry.url);
+      }
+    }
+  }
+
+  return urls;
 }
 
 export function getFirefoxTabs(): string[] {
@@ -120,25 +151,56 @@ export function getFirefoxTabs(): string[] {
     const session = readSessionStore(recoveryPath);
     if (!session) return [];
 
-    const urls: string[] = [];
-
-    // Extract URLs from all windows and tabs
-    for (const window of session.windows) {
-      for (const tab of window.tabs) {
-        // tab.entries is history for that tab. tab.index is the current position (1-based)
-        const activeEntryIndex = (tab.index || 1) - 1;
-        if (tab.entries && tab.entries[activeEntryIndex]) {
-          const url = tab.entries[activeEntryIndex].url;
-          if (url) {
-            urls.push(url);
-          }
-        }
-      }
-    }
-
-    return urls;
+    return extractTabUrls(session);
   } catch (e) {
     console.error("Error reading Firefox session:", e);
     return [];
+  }
+}
+
+/**
+ * The URL of the currently-focused tab within a session.
+ *
+ * `selectedWindow` (1-based) identifies the focused window; `window.selected`
+ * (1-based) the active tab within it. Falls back to the first window if
+ * `selectedWindow` is absent. Private windows are never returned.
+ */
+export function getActiveTabUrl(session: FirefoxSession): string | null {
+  const windowIndex = (session.selectedWindow || 1) - 1;
+  const window = session.windows[windowIndex] ?? session.windows[0];
+  if (!window || window.isPrivate) return null;
+
+  const tab = window.tabs[(window.selected || 1) - 1];
+  const entry = tab?.entries?.[(tab.index || 1) - 1];
+  return entry?.url ?? null;
+}
+
+/**
+ * The active tab's URL, read from the on-disk session store.
+ *
+ * Firefox exposes no AppleScript API for reading the active tab, so the session
+ * store is the only way to get it without a browser add-on. It is flushed to disk
+ * periodically (~every 15s and on navigation), so a tab opened in the last few
+ * seconds may not appear yet — this is the best available for Firefox.
+ */
+export function getFirefoxActiveUrl(): string | null {
+  try {
+    const firefoxDir = path.join(
+      os.homedir(),
+      "Library",
+      "Application Support",
+      "Firefox",
+    );
+
+    const recoveryPath = findRecoveryFile(firefoxDir);
+    if (!recoveryPath) return null;
+
+    const session = readSessionStore(recoveryPath);
+    if (!session) return null;
+
+    return getActiveTabUrl(session);
+  } catch (e) {
+    console.error("Error reading Firefox active tab:", e);
+    return null;
   }
 }
